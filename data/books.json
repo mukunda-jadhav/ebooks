@@ -1,0 +1,16 @@
+[
+  {
+    "id": "marketing",
+    "title": "why the fuck",
+    "description": "A focused introduction to content, search, email, analytics, and campaigns that turn attention into growth.",
+    "price": 99,
+    "cover": "/covers/1788187986418-d10b753cafa5.jpg",
+    "filename": "ebooks/1788198356982-7b97012b41cc0e58.pdf",
+    "features": [
+      "Customer-focused strategy",
+      "Content and SEO",
+      "Email campaign systems",
+      "Metrics that matter"
+    ]
+  }
+]
