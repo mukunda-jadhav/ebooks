@@ -252,7 +252,8 @@ function publicBook(book) {
 }
 
 function siteUrl() {
-  return (process.env.SITE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+  const renderUrl = process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : '';
+  return (process.env.SITE_URL || renderUrl || `http://localhost:${PORT}`).replace(/\/$/, '');
 }
 
 function escapeMarkup(value) {
@@ -647,11 +648,11 @@ app.use((error, req, res, next) => {
 
 function validateProductionConfig() {
   if (process.env.NODE_ENV !== 'production') return;
-  const required = ['SITE_URL', 'ADMIN_PASSWORD', 'RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'MONGODB_URI', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_STORAGE_BUCKET'];
+  const required = ['ADMIN_PASSWORD', 'RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'MONGODB_URI', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_STORAGE_BUCKET'];
   const missing = required.filter((key) => !configured(key));
   if (missing.length) throw new Error(`Missing required production configuration: ${missing.join(', ')}`);
   if (process.env.ADMIN_PASSWORD.length < 16) throw new Error('ADMIN_PASSWORD must contain at least 16 characters in production');
-  if (!/^https:\/\//.test(process.env.SITE_URL)) throw new Error('SITE_URL must use HTTPS in production');
+  if (!/^https:\/\//.test(siteUrl())) throw new Error('SITE_URL must use HTTPS in production');
 }
 
 let httpServer;

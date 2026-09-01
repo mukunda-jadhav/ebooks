@@ -36,3 +36,14 @@ The production process deliberately refuses to start when MongoDB, Supabase Stor
 MongoDB stores books, orders, purchases, download claims, admin sessions, and rate limits as separate indexed records. The Supabase bucket must remain private. If a download connection fails before completion, its one-time token is released safely; completed downloads consume the token.
 
 Use Razorpay test-mode credentials while developing. Only `RAZORPAY_KEY_ID` is returned to checkout; `RAZORPAY_KEY_SECRET` stays on the server. In production, put the app behind HTTPS, use persistent shared storage/locking if running multiple Node processes, and replace the included sample PDFs with the real ebooks while keeping the same catalog filenames.
+
+### Deploy on Render
+
+The included `render.yaml` creates a free Node web service, runs `npm ci`, starts the app with `npm start`, enables automatic deploys from `main`, and checks `/healthz`.
+
+1. In Render, choose **New → Blueprint** and connect `mukunda-jadhav/ebooks`.
+2. Enter the five secret values requested by the Blueprint: `MONGODB_URI`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `RAZORPAY_KEY_ID`, and `RAZORPAY_KEY_SECRET`.
+3. Deploy the Blueprint. Render generates the admin password and automatically supplies the public hostname used for canonical URLs.
+4. Open the service's **Environment** page to reveal or replace `ADMIN_PASSWORD` before signing in at `/admin`.
+
+Use Razorpay test keys for the first deployment. Add the final Render URL to Razorpay configuration before switching to live keys.
