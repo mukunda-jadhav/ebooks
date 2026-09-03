@@ -247,7 +247,9 @@ function publicBook(book) {
     description: book.description,
     price: book.price,
     cover: book.cover,
-    features: book.features
+    features: book.features,
+    author: book.author || 'ReadVault',
+    category: book.category || 'General'
   };
 }
 
@@ -449,7 +451,9 @@ app.post('/api/admin/books', requireAdmin, (req, res, next) => upload(req, res, 
       uploadedCoverKey = coverKey;
     }
     const features = String(req.body.features || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 10);
-    const book = { id, title, description, price: Math.round(price * 100) / 100, cover, filename, features, ...(coverKey ? { coverKey } : {}) };
+    const author = cleanText(req.body.author, 'Author', 120);
+    const category = cleanText(req.body.category, 'Category', 80);
+    const book = { id, title, author, category, description, price: Math.round(price * 100) / 100, cover, filename, features, ...(coverKey ? { coverKey } : {}) };
     await addBook(book);
     res.status(201).json(book);
   } catch (error) {
@@ -467,7 +471,7 @@ app.put('/api/admin/books/:id', requireAdmin, (req, res, next) => upload(req, re
     if (!current) throw Object.assign(new Error('Book not found'), { status: 404 });
     const price = Number(req.body.price);
     if (!Number.isFinite(price) || price < 0 || price > 100000) throw Object.assign(new Error('Price is invalid'), { status: 400 });
-    const updated = { ...current, title: cleanText(req.body.title, 'Title', 120), description: cleanText(req.body.description, 'Description', 1200), price: Math.round(price * 100) / 100, features: String(req.body.features || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 10) };
+    const updated = { ...current, title: cleanText(req.body.title, 'Title', 120), author: cleanText(req.body.author, 'Author', 120), category: cleanText(req.body.category, 'Category', 80), description: cleanText(req.body.description, 'Description', 1200), price: Math.round(price * 100) / 100, features: String(req.body.features || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 10) };
     const previousFilename = current.filename;
     const previousCoverKey = current.coverKey;
     if (req.files?.ebook?.[0]) { updated.filename = await storeEbook(req.files.ebook[0]); replacementEbook = updated.filename; }
@@ -540,8 +544,10 @@ app.get('/books/:id', (req, res, next) => {
     if (!book) return res.status(404).send('Book not found');
     const canonical = `${siteUrl()}/books/${encodeURIComponent(book.id)}`;
     const cover = /^(https?:\/\/)/.test(book.cover) ? book.cover : `${siteUrl()}${book.cover.startsWith('/') ? '' : '/'}${book.cover}`;
-    const schema = JSON.stringify({ '@context': 'https://schema.org', '@type': 'Book', name: book.title, description: book.description, image: cover, offers: { '@type': 'Offer', priceCurrency: 'INR', price: book.price, availability: 'https://schema.org/InStock', url: canonical } }).replace(/</g, '\\u003c');
-    const metadata = `<meta name="description" content="${escapeMarkup(book.description)}"><link rel="canonical" href="${escapeMarkup(canonical)}"><meta property="og:type" content="product"><meta property="og:title" content="${escapeMarkup(book.title)}"><meta property="og:description" content="${escapeMarkup(book.description)}"><meta property="og:url" content="${escapeMarkup(canonical)}"><meta property="og:image" content="${escapeMarkup(cover)}"><meta name="twitter:card" content="summary_large_image"><script type="application/ld+json">${schema}</script>`;
+    const author = book.author || 'ReadVault';
+    const category = book.category || 'General';
+    const schema = JSON.stringify({ '@context': 'https://schema.org', '@type': 'Book', name: book.title, author: { '@type': 'Person', name: author }, genre: category, description: book.description, image: cover, offers: { '@type': 'Offer', priceCurrency: 'INR', price: book.price, availability: 'https://schema.org/InStock', url: canonical } }).replace(/</g, '\\u003c');
+    const metadata = `<meta name="description" content="${escapeMarkup(book.description)}"><meta name="author" content="${escapeMarkup(author)}"><link rel="canonical" href="${escapeMarkup(canonical)}"><meta property="og:type" content="book"><meta property="og:title" content="${escapeMarkup(book.title)}"><meta property="og:description" content="${escapeMarkup(book.description)}"><meta property="og:url" content="${escapeMarkup(canonical)}"><meta property="og:image" content="${escapeMarkup(cover)}"><meta property="book:author" content="${escapeMarkup(author)}"><meta name="twitter:card" content="summary_large_image"><script type="application/ld+json">${schema}</script>`;
     const template = fs.readFileSync(path.join(ROOT, 'public', 'book.html'), 'utf8');
     res.type('html').send(template.replace('<title>Book details — ReadVault</title>', `<title>${escapeMarkup(book.title)} — ReadVault</title>${metadata}`));
   } catch (error) { next(error); }

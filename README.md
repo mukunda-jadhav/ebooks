@@ -14,7 +14,9 @@ On Windows PowerShell, use `Copy-Item .env.example .env` instead of `cp` if need
 
 ## Admin panel
 
-Set a strong `ADMIN_PASSWORD` in `.env`, restart the server, and open <http://localhost:3000/admin>. The panel supports PDF and cover uploads, pricing, descriptions, highlights, editing, and deleting books. Uploaded PDFs remain private; covers are stored under `public/covers`.
+Set a strong `ADMIN_PASSWORD` in `.env`, restart the server, and open <http://localhost:3000/admin>. The panel supports PDF and cover uploads, authors, categories, pricing, descriptions, highlights, editing, and deleting books. Each book also has a **Copy link** action for sharing or using as a Meta Ads destination URL. Uploaded PDFs remain private; covers are stored under `public/covers`.
+
+Public links use the format `https://your-domain.example/books/book-id`. You may append Meta Ads UTM parameters (for example, `?utm_source=facebook&utm_medium=paid_social&utm_campaign=launch`) without affecting the book page. Shared pages include title, description, cover, author, canonical, Open Graph, and structured book metadata.
 
 ## Free cloud storage setup
 
