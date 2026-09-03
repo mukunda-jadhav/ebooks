@@ -5,6 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const { MongoClient } = require('mongodb');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
 const { Readable } = require('stream');
 require('dotenv').config();
 
@@ -13,16 +15,21 @@ const PORT = Number(process.env.PORT) || 3000;
 const ROOT = __dirname;
 const BOOKS_FILE = path.join(ROOT, 'data', 'books.json');
 const STORE_FILE = path.join(ROOT, 'data', 'purchases.json');
+const USERS_FILE = path.join(ROOT, 'data', 'users.local.json');
 const PRIVATE_BOOKS = path.join(ROOT, 'private-books');
 const COVERS_DIR = path.join(ROOT, 'public', 'covers');
 const TOKEN_LIFETIME_MS = 30 * 60 * 1000;
+const USER_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 
 let books = JSON.parse(fs.readFileSync(BOOKS_FILE, 'utf8'));
 let booksById = new Map(books.map((book) => [book.id, book]));
 let store = loadStore();
+let localUsers = loadLocalUsers();
 let mutationQueue = Promise.resolve();
 let catalogQueue = Promise.resolve();
+let usersQueue = Promise.resolve();
 const adminSessions = new Map();
+const userSessions = new Map();
 fs.mkdirSync(COVERS_DIR, { recursive: true });
 let database;
 let mongoClient;
@@ -32,6 +39,12 @@ function configured(key) {
   return Boolean(value && !value.startsWith('your_') && !value.includes('example.mongodb.net') && !value.includes('your-domain.example') && !value.includes('your-project.supabase.co'));
 }
 const cloudStorageEnabled = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_STORAGE_BUCKET'].every(configured);
+const firebaseConfigured = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'FIREBASE_API_KEY', 'FIREBASE_AUTH_DOMAIN'].every(configured);
+let firebaseAuth;
+if (firebaseConfigured) {
+  const firebaseApp = getApps()[0] || initializeApp({ credential: cert({ projectId: process.env.FIREBASE_PROJECT_ID, clientEmail: process.env.FIREBASE_CLIENT_EMAIL, privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') }) });
+  firebaseAuth = getAuth(firebaseApp);
+}
 
 function supabaseHeaders(extra = {}) {
   return { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, ...extra };
@@ -72,6 +85,23 @@ function loadStore() {
   }
 }
 
+function loadLocalUsers() {
+  try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw new Error(`Unable to load local users: ${error.message}`); }
+}
+
+function saveLocalUsers(mutator) {
+  const operation = usersQueue.then(async () => {
+    const result = await mutator(localUsers);
+    const temporary = `${USERS_FILE}.${process.pid}.tmp`;
+    await fs.promises.writeFile(temporary, JSON.stringify(localUsers, null, 2));
+    await fs.promises.rename(temporary, USERS_FILE);
+    return result;
+  });
+  usersQueue = operation.catch(() => {});
+  return operation;
+}
+
 // Serializing mutations makes the one-time check and update atomic in this process.
 function mutateStore(mutator) {
   const operation = mutationQueue.then(async () => {
@@ -109,6 +139,81 @@ function saveCatalog(nextBooks) {
 
 function sessionToken(req) {
   return (req.headers.cookie || '').split(';').map((item) => item.trim()).find((item) => item.startsWith('admin_session='))?.split('=')[1];
+}
+
+function cookieToken(req, name) {
+  const item = (req.headers.cookie || '').split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`));
+  if (!item) return undefined;
+  try { return decodeURIComponent(item.slice(name.length + 1)); } catch { return undefined; }
+}
+
+function tokenHash(token) { return crypto.createHash('sha256').update(token).digest('hex'); }
+
+async function userSession(req) {
+  const token = cookieToken(req, 'user_session');
+  if (!token) return null;
+  const hash = tokenHash(token);
+  if (database) {
+    const session = await database.collection('user_sessions').findOne({ tokenHash: hash, expiresAt: { $gt: new Date() } });
+    if (!session) return null;
+    const user = await database.collection('users').findOne({ id: session.userId, activeSessionHash: hash });
+    return user ? { id: user.id, name: user.name, email: user.email } : null;
+  }
+  const session = userSessions.get(hash);
+  if (!session || session.expiresAt < Date.now()) { userSessions.delete(hash); return null; }
+  const user = localUsers.find((item) => item.id === session.userId && item.activeSessionHash === hash);
+  return user ? { id: user.id, name: user.name, email: user.email } : null;
+}
+
+async function requireUser(req, res, next) {
+  try {
+    req.user = await userSession(req);
+    if (!req.user) return res.status(401).json({ error: 'Please sign in to continue' });
+    next();
+  } catch (error) { next(error); }
+}
+
+function normalizeEmail(value) {
+  const email = String(value || '').trim().toLowerCase();
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw Object.assign(new Error('Enter a valid email address'), { status: 400 });
+  return email;
+}
+
+async function firebaseRequest(endpoint, body) {
+  if (!firebaseConfigured) throw Object.assign(new Error('Firebase Authentication is not configured'), { status: 503 });
+  const response = await fetch(`https://identitytoolkit.googleapis.com/v1/${endpoint}?key=${encodeURIComponent(process.env.FIREBASE_API_KEY)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const code = data.error?.message || '';
+    const messages = { EMAIL_EXISTS: 'An account with this email already exists', INVALID_LOGIN_CREDENTIALS: 'Email or password is incorrect', EMAIL_NOT_FOUND: 'Email or password is incorrect', INVALID_PASSWORD: 'Email or password is incorrect', WEAK_PASSWORD: 'Password must be at least 6 characters', TOO_MANY_ATTEMPTS_TRY_LATER: 'Too many attempts. Try again later.' };
+    throw Object.assign(new Error(messages[code] || 'Authentication request failed'), { status: code === 'EMAIL_EXISTS' ? 409 : code === 'TOO_MANY_ATTEMPTS_TRY_LATER' ? 429 : 400 });
+  }
+  return data;
+}
+
+async function saveUserProfile(identity) {
+  const user = { id: identity.uid, name: identity.name || identity.email.split('@')[0], email: identity.email, provider: identity.provider || 'password', updatedAt: new Date() };
+  if (database) await database.collection('users').updateOne({ id: user.id }, { $set: user, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+  else await saveLocalUsers((users) => { const existing = users.find((item) => item.id === user.id); if (existing) Object.assign(existing, user); else users.push({ ...user, createdAt: new Date().toISOString() }); });
+  return user;
+}
+
+async function startUserSession(identity, res) {
+  const user = await saveUserProfile(identity);
+  const token = crypto.randomBytes(32).toString('hex');
+  const hash = tokenHash(token);
+  const expiresAt = new Date(Date.now() + USER_SESSION_LIFETIME_MS);
+  if (database) {
+    await database.collection('user_sessions').deleteMany({ userId: user.id });
+    await database.collection('user_sessions').insertOne({ userId: user.id, tokenHash: hash, expiresAt });
+    await database.collection('users').updateOne({ id: user.id }, { $set: { activeSessionHash: hash, updatedAt: new Date() } });
+  } else {
+    for (const [key, session] of userSessions) if (session.userId === user.id) userSessions.delete(key);
+    userSessions.set(hash, { userId: user.id, expiresAt: expiresAt.getTime() });
+    await saveLocalUsers((users) => { const saved = users.find((item) => item.id === user.id); saved.activeSessionHash = hash; });
+  }
+  res.setHeader('Set-Cookie', `user_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${USER_SESSION_LIFETIME_MS / 1000}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
+  return { id: user.id, name: user.name, email: user.email };
 }
 
 async function adminSession(req) {
@@ -236,6 +341,11 @@ async function connectDatabase() {
   await database.collection('purchases').createIndex({ paymentId: 1 }, { unique: true });
   await database.collection('purchases').createIndex({ orderId: 1 }, { unique: true });
   await database.collection('admin_sessions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  await database.collection('users').createIndex({ email: 1 }, { unique: true });
+  await database.collection('users').createIndex({ id: 1 }, { unique: true });
+  await database.collection('user_sessions').createIndex({ tokenHash: 1 }, { unique: true });
+  await database.collection('user_sessions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  await database.collection('purchases').createIndex({ userId: 1, createdAt: -1 });
   await database.collection('rate_limits').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   console.log('Catalog and purchases connected to MongoDB Atlas');
 }
@@ -363,7 +473,7 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://*.razorpay.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https:; frame-src https://*.razorpay.com; connect-src 'self' https://*.razorpay.com");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://*.razorpay.com https://www.gstatic.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https:; frame-src https://*.razorpay.com https://accounts.google.com https://*.firebaseapp.com; connect-src 'self' https://*.razorpay.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://accounts.google.com");
   if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   next();
 });
@@ -397,6 +507,93 @@ app.get('/healthz', async (req, res) => {
     if (database) await database.command({ ping: 1 });
     res.json({ status: 'ok', database: database ? 'connected' : 'local', storage: cloudStorageEnabled ? 'supabase' : 'local' });
   } catch { res.status(503).json({ status: 'unhealthy' }); }
+});
+
+const passwordLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, skipSuccessfulRequests: true, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many login attempts. Try again in 15 minutes.' } });
+const accountActionLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 5, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many email requests. Try again later.' } });
+
+app.get('/api/auth/firebase-config', (req, res) => res.json(firebaseConfigured ? { apiKey: process.env.FIREBASE_API_KEY, authDomain: process.env.FIREBASE_AUTH_DOMAIN, projectId: process.env.FIREBASE_PROJECT_ID, appId: process.env.FIREBASE_APP_ID || undefined } : null));
+
+app.post('/api/auth/register', accountActionLimiter, async (req, res, next) => {
+  try {
+    const name = cleanText(req.body?.name, 'Name', 80), email = normalizeEmail(req.body?.email), password = String(req.body?.password || '');
+    if (password.length < 8 || password.length > 128) return res.status(400).json({ error: 'Password must be 8 to 128 characters' });
+    const signup = await firebaseRequest('accounts:signUp', { email, password, returnSecureToken: true });
+    await firebaseAuth.updateUser(signup.localId, { displayName: name });
+    await firebaseRequest('accounts:sendOobCode', { requestType: 'VERIFY_EMAIL', idToken: signup.idToken });
+    res.status(201).json({ success: true, message: 'Account created. Check your email and verify it before signing in.' });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/auth/login', passwordLoginLimiter, async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.body?.email), password = String(req.body?.password || '');
+    const login = await firebaseRequest('accounts:signInWithPassword', { email, password, returnSecureToken: true });
+    const record = await firebaseAuth.getUser(login.localId);
+    if (!record.emailVerified) return res.status(403).json({ error: 'Verify your email before signing in. Use “Resend verification” if needed.' });
+    const user = await startUserSession({ uid: record.uid, name: record.displayName, email: record.email, provider: 'password' }, res);
+    res.json({ user });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/auth/google', passwordLoginLimiter, async (req, res, next) => {
+  try {
+    const idToken = String(req.body?.idToken || '');
+    if (!firebaseAuth || idToken.length < 100 || idToken.length > 10000) return res.status(400).json({ error: 'Invalid Google sign-in response' });
+    const decoded = await firebaseAuth.verifyIdToken(idToken, true);
+    if (!decoded.email || !decoded.email_verified) return res.status(403).json({ error: 'Google account email is not verified' });
+    const user = await startUserSession({ uid: decoded.uid, name: decoded.name, email: decoded.email, provider: 'google' }, res);
+    res.json({ user });
+  } catch (error) { next(Object.assign(new Error('Google sign-in could not be verified'), { status: 401 })); }
+});
+
+app.post('/api/auth/resend-verification', accountActionLimiter, async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.body?.email), password = String(req.body?.password || '');
+    const login = await firebaseRequest('accounts:signInWithPassword', { email, password, returnSecureToken: true });
+    await firebaseRequest('accounts:sendOobCode', { requestType: 'VERIFY_EMAIL', idToken: login.idToken });
+    res.json({ success: true, message: 'Verification email sent.' });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/auth/reset-password', accountActionLimiter, async (req, res, next) => {
+  try { await firebaseRequest('accounts:sendOobCode', { requestType: 'PASSWORD_RESET', email: normalizeEmail(req.body?.email) }); }
+  catch (error) { if (error.status === 503) return next(error); if (error.message !== 'Email or password is incorrect') console.error('Password reset request failed:', error.message); }
+  res.json({ success: true, message: 'If an account exists for that email, Firebase sent a password-reset link.' });
+});
+
+app.get('/api/auth/me', async (req, res, next) => {
+  try { res.json({ user: await userSession(req) }); } catch (error) { next(error); }
+});
+
+app.post('/api/auth/logout', async (req, res, next) => {
+  try {
+    const token = cookieToken(req, 'user_session');
+    const hash = token && tokenHash(token);
+    if (hash && database) {
+      const session = await database.collection('user_sessions').findOne({ tokenHash: hash });
+      await database.collection('user_sessions').deleteOne({ tokenHash: hash });
+      if (session) await database.collection('users').updateOne({ id: session.userId, activeSessionHash: hash }, { $unset: { activeSessionHash: '' } });
+    } else if (hash) userSessions.delete(hash);
+    res.setHeader('Set-Cookie', 'user_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+    res.json({ success: true });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/library', requireUser, async (req, res, next) => {
+  try {
+    const purchases = database
+      ? await database.collection('purchases').find({ userId: req.user.id, paymentVerified: true }).sort({ createdAt: -1 }).toArray()
+      : store.purchases.filter((item) => item.userId === req.user.id && item.paymentVerified).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const seen = new Set();
+    const library = purchases.flatMap((purchase) => {
+      if (seen.has(purchase.bookId)) return [];
+      seen.add(purchase.bookId);
+      const book = booksById.get(purchase.bookId);
+      return book ? [{ ...publicBook(book), purchasedAt: purchase.createdAt }] : [];
+    });
+    res.json({ user: req.user, books: library });
+  } catch (error) { next(error); }
 });
 
 app.post('/api/admin/login', async (req, res, next) => {
@@ -553,23 +750,27 @@ app.get('/books/:id', (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post('/api/create-order', async (req, res, next) => {
+app.post('/api/create-order', requireUser, async (req, res, next) => {
   try {
     const book = booksById.get(req.body?.bookId);
     if (!book) return res.status(400).json({ error: 'Invalid book ID' });
+    const owned = database
+      ? await database.collection('purchases').findOne({ userId: req.user.id, bookId: book.id, paymentVerified: true })
+      : store.purchases.find((item) => item.userId === req.user.id && item.bookId === book.id && item.paymentVerified);
+    if (owned) return res.status(409).json({ error: 'You already own this ebook. Download it from My Library.' });
     const amount = Math.round(book.price * 100);
     const order = await razorpayRequest('/orders', { method: 'POST', body: {
       amount,
       currency: 'INR',
       receipt: `book_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
-      notes: { bookId: book.id }
+      notes: { bookId: book.id, userId: req.user.id }
     } });
-    await saveOrder({ orderId: order.id, bookId: book.id, amount, currency: 'INR', createdAt: new Date() });
+    await saveOrder({ orderId: order.id, bookId: book.id, userId: req.user.id, amount, currency: 'INR', createdAt: new Date() });
     res.json({ orderId: order.id, amount, currency: 'INR', keyId: process.env.RAZORPAY_KEY_ID });
   } catch (error) { next(error); }
 });
 
-app.post('/api/verify-payment', async (req, res, next) => {
+app.post('/api/verify-payment', requireUser, async (req, res, next) => {
   try {
     const { bookId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
     const book = booksById.get(bookId);
@@ -583,7 +784,7 @@ app.post('/api/verify-payment', async (req, res, next) => {
 
     const localOrder = await findOrder(razorpay_order_id);
     const expectedAmount = Math.round(book.price * 100);
-    if (!localOrder || localOrder.bookId !== bookId || localOrder.amount !== expectedAmount) {
+    if (!localOrder || localOrder.bookId !== bookId || localOrder.userId !== req.user.id || localOrder.amount !== expectedAmount) {
       return res.status(400).json({ error: 'Order does not match this book' });
     }
 
@@ -595,7 +796,7 @@ app.post('/api/verify-payment', async (req, res, next) => {
 
     const token = crypto.randomBytes(32).toString('hex');
     const createdAt = new Date();
-    const created = await createPurchase({ token, bookId, paymentId: razorpay_payment_id, orderId: razorpay_order_id, createdAt, expiresAt: new Date(createdAt.getTime() + TOKEN_LIFETIME_MS), state: 'ready', used: false, paymentVerified: true });
+    const created = await createPurchase({ token, bookId, userId: req.user.id, paymentId: razorpay_payment_id, orderId: razorpay_order_id, createdAt, expiresAt: new Date(createdAt.getTime() + TOKEN_LIFETIME_MS), state: 'ready', used: false, paymentVerified: true });
     if (!created) return res.status(409).json({ error: 'This payment has already been verified' });
     res.json({ success: true, downloadToken: token });
   } catch (error) { next(error); }
@@ -644,6 +845,27 @@ app.post('/api/download', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/api/library/:bookId/download', requireUser, async (req, res, next) => {
+  try {
+    const book = booksById.get(req.params.bookId);
+    if (!book) return res.status(404).json({ error: 'Book not found' });
+    const purchase = database
+      ? await database.collection('purchases').findOne({ userId: req.user.id, bookId: book.id, paymentVerified: true })
+      : store.purchases.find((item) => item.userId === req.user.id && item.bookId === book.id && item.paymentVerified);
+    if (!purchase) return res.status(403).json({ error: 'This ebook is not in your library' });
+    if (cloudStorageEnabled && book.filename.startsWith('ebooks/')) {
+      const object = await storageRequest(`/object/authenticated/${encodeURIComponent(process.env.SUPABASE_STORAGE_BUCKET)}/${book.filename}`);
+      res.setHeader('Content-Type', 'application/pdf');
+      if (object.headers.get('content-length')) res.setHeader('Content-Length', object.headers.get('content-length'));
+      res.setHeader('Content-Disposition', `attachment; filename="${book.id}.pdf"`);
+      return Readable.fromWeb(object.body).pipe(res);
+    }
+    const filePath = path.resolve(PRIVATE_BOOKS, book.filename);
+    if (path.dirname(filePath) !== path.resolve(PRIVATE_BOOKS)) return res.status(403).json({ error: 'Book is unavailable' });
+    res.download(filePath, `${book.id}.pdf`);
+  } catch (error) { next(error); }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ error: 'API endpoint not found' }));
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
@@ -654,7 +876,7 @@ app.use((error, req, res, next) => {
 
 function validateProductionConfig() {
   if (process.env.NODE_ENV !== 'production') return;
-  const required = ['ADMIN_PASSWORD', 'RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'MONGODB_URI', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_STORAGE_BUCKET'];
+  const required = ['ADMIN_PASSWORD', 'RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'MONGODB_URI', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_STORAGE_BUCKET', 'FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'FIREBASE_API_KEY', 'FIREBASE_AUTH_DOMAIN'];
   const missing = required.filter((key) => !configured(key));
   if (missing.length) throw new Error(`Missing required production configuration: ${missing.join(', ')}`);
   if (process.env.ADMIN_PASSWORD.length < 16) throw new Error('ADMIN_PASSWORD must contain at least 16 characters in production');

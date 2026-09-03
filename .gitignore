@@ -1,6 +1,7 @@
 node_modules/
 .env
-.env.example
 npm-debug.log*
 data/uploads/
+data/users.local.json
+data/users.local.json.*.tmp
 public/covers/
