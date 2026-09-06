@@ -42,7 +42,12 @@ const cloudStorageEnabled = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPAB
 const firebaseConfigured = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'FIREBASE_API_KEY', 'FIREBASE_AUTH_DOMAIN'].every(configured);
 let firebaseAuth;
 if (firebaseConfigured) {
-  const firebaseApp = getApps()[0] || initializeApp({ credential: cert({ projectId: process.env.FIREBASE_PROJECT_ID, clientEmail: process.env.FIREBASE_CLIENT_EMAIL, privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n') }) });
+  const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY
+    ?.replace(/^(['"])(.*)\1$/s, '$2')
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .trim();
+  const firebaseApp = getApps()[0] || initializeApp({ credential: cert({ projectId: process.env.FIREBASE_PROJECT_ID, clientEmail: process.env.FIREBASE_CLIENT_EMAIL, privateKey: firebasePrivateKey }) });
   firebaseAuth = getAuth(firebaseApp);
 }
 
