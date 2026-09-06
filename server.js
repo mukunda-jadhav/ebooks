@@ -42,7 +42,7 @@ const cloudStorageEnabled = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPAB
 const firebaseConfigured = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'FIREBASE_API_KEY', 'FIREBASE_AUTH_DOMAIN'].every(configured);
 let firebaseAuth;
 if (firebaseConfigured) {
-  const firebaseApp = getApps()[0] || initializeApp({ credential: cert({ projectId: process.env.FIREBASE_PROJECT_ID, clientEmail: process.env.FIREBASE_CLIENT_EMAIL, privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') }) });
+  const firebaseApp = getApps()[0] || initializeApp({ credential: cert({ projectId: process.env.FIREBASE_PROJECT_ID, clientEmail: process.env.FIREBASE_CLIENT_EMAIL, privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n') }) });
   firebaseAuth = getAuth(firebaseApp);
 }
 
@@ -171,6 +171,56 @@ async function requireUser(req, res, next) {
     if (!req.user) return res.status(401).json({ error: 'Please sign in to continue' });
     next();
   } catch (error) { next(error); }
+}
+
+async function ownedBook(userId, bookId) {
+  const book = booksById.get(bookId);
+  if (!book) return null;
+  const purchase = database
+    ? await database.collection('purchases').findOne({ userId, bookId, paymentVerified: true })
+    : store.purchases.find((item) => item.userId === userId && item.bookId === bookId && item.paymentVerified);
+  return purchase ? book : null;
+}
+
+function readerNumber(value, min, max, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
+}
+
+function sanitizeReaderState(input) {
+  const colors = new Set(['yellow', 'green', 'blue', 'pink']);
+  const bookmarks = [...new Set((Array.isArray(input?.bookmarks) ? input.bookmarks : [])
+    .map((page) => Math.round(readerNumber(page, 1, 100000, 1))))].slice(0, 200);
+  const annotations = (Array.isArray(input?.annotations) ? input.annotations : []).slice(0, 300).flatMap((item) => {
+    if (!item || typeof item.id !== 'string' || !/^[a-zA-Z0-9-]{8,64}$/.test(item.id)) return [];
+    const rects = (Array.isArray(item.rects) ? item.rects : []).slice(0, 40).flatMap((rect) => {
+      if (!rect) return [];
+      const clean = {
+        x: readerNumber(rect.x, 0, 1, 0), y: readerNumber(rect.y, 0, 1, 0),
+        width: readerNumber(rect.width, 0, 1, 0), height: readerNumber(rect.height, 0, 1, 0)
+      };
+      return clean.width > 0 && clean.height > 0 ? [clean] : [];
+    });
+    if (!rects.length) return [];
+    return [{
+      id: item.id,
+      page: Math.round(readerNumber(item.page, 1, 100000, 1)),
+      text: String(item.text || '').trim().slice(0, 1000),
+      note: String(item.note || '').trim().slice(0, 3000),
+      color: colors.has(item.color) ? item.color : 'yellow',
+      rects,
+      createdAt: typeof item.createdAt === 'string' ? item.createdAt.slice(0, 40) : new Date().toISOString()
+    }];
+  });
+  return {
+    page: Math.round(readerNumber(input?.page, 1, 100000, 1)),
+    pageCount: Math.round(readerNumber(input?.pageCount, 0, 100000, 0)),
+    scale: Math.round(readerNumber(input?.scale, 0.75, 2, 1.1) * 100) / 100,
+    mode: ['light', 'sepia', 'dark'].includes(input?.mode) ? input.mode : 'light',
+    bookmarks,
+    annotations,
+    updatedAt: new Date()
+  };
 }
 
 function normalizeEmail(value) {
@@ -346,6 +396,7 @@ async function connectDatabase() {
   await database.collection('user_sessions').createIndex({ tokenHash: 1 }, { unique: true });
   await database.collection('user_sessions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await database.collection('purchases').createIndex({ userId: 1, createdAt: -1 });
+  await database.collection('reader_states').createIndex({ userId: 1, bookId: 1 }, { unique: true });
   await database.collection('rate_limits').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   console.log('Catalog and purchases connected to MongoDB Atlas');
 }
@@ -473,11 +524,11 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://*.razorpay.com https://www.gstatic.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https:; frame-src https://*.razorpay.com https://accounts.google.com https://*.firebaseapp.com; connect-src 'self' https://*.razorpay.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://accounts.google.com");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://*.razorpay.com https://www.gstatic.com https://apis.google.com https://cdn.jsdelivr.net; worker-src 'self' blob: https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https:; frame-src https://*.razorpay.com https://accounts.google.com https://*.firebaseapp.com; connect-src 'self' https://*.razorpay.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://accounts.google.com https://cdn.jsdelivr.net");
   if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   next();
 });
-app.use(express.json({ limit: '20kb' }));
+app.use(express.json({ limit: '100kb' }));
 const localApiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false });
 app.use('/api', async (req, res, next) => {
   if (!database) return localApiLimiter(req, res, next);
@@ -593,6 +644,69 @@ app.get('/api/library', requireUser, async (req, res, next) => {
       return book ? [{ ...publicBook(book), purchasedAt: purchase.createdAt }] : [];
     });
     res.json({ user: req.user, books: library });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/reader/:bookId', requireUser, async (req, res, next) => {
+  try {
+    const book = await ownedBook(req.user.id, req.params.bookId);
+    if (!book) return res.status(403).json({ error: 'This ebook is not in your library' });
+    let state;
+    if (database) {
+      state = await database.collection('reader_states').findOne(
+        { userId: req.user.id, bookId: book.id }, { projection: { _id: 0, userId: 0, bookId: 0 } }
+      );
+    } else {
+      const user = localUsers.find((item) => item.id === req.user.id);
+      state = user?.readerStates?.[book.id];
+    }
+    res.json({ book: publicBook(book), state: state || sanitizeReaderState({}) });
+  } catch (error) { next(error); }
+});
+
+app.put('/api/reader/:bookId/state', requireUser, async (req, res, next) => {
+  try {
+    const book = await ownedBook(req.user.id, req.params.bookId);
+    if (!book) return res.status(403).json({ error: 'This ebook is not in your library' });
+    const state = sanitizeReaderState(req.body);
+    if (database) {
+      await database.collection('reader_states').updateOne(
+        { userId: req.user.id, bookId: book.id },
+        { $set: { ...state, userId: req.user.id, bookId: book.id } },
+        { upsert: true }
+      );
+    } else {
+      await saveLocalUsers((users) => {
+        const user = users.find((item) => item.id === req.user.id);
+        if (!user) throw Object.assign(new Error('User account not found'), { status: 404 });
+        user.readerStates ||= {};
+        user.readerStates[book.id] = { ...state, updatedAt: state.updatedAt.toISOString() };
+      });
+    }
+    res.json({ success: true, updatedAt: state.updatedAt });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/reader/:bookId/file', requireUser, async (req, res, next) => {
+  try {
+    const book = await ownedBook(req.user.id, req.params.bookId);
+    if (!book) return res.status(403).json({ error: 'This ebook is not in your library' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${book.id}.pdf"`);
+    res.setHeader('Cache-Control', 'private, no-store');
+    if (cloudStorageEnabled && book.filename.startsWith('ebooks/')) {
+      const headers = req.headers.range ? { Range: req.headers.range } : {};
+      const object = await storageRequest(`/object/authenticated/${encodeURIComponent(process.env.SUPABASE_STORAGE_BUCKET)}/${book.filename}`, { headers });
+      for (const name of ['content-length', 'content-range', 'accept-ranges']) {
+        const value = object.headers.get(name);
+        if (value) res.setHeader(name, value);
+      }
+      if (object.status === 206) res.status(206);
+      return Readable.fromWeb(object.body).pipe(res);
+    }
+    const filePath = path.resolve(PRIVATE_BOOKS, book.filename);
+    if (path.dirname(filePath) !== path.resolve(PRIVATE_BOOKS)) return res.status(403).json({ error: 'Book is unavailable' });
+    res.sendFile(filePath);
   } catch (error) { next(error); }
 });
 
